@@ -1,0 +1,316 @@
+---
+title: "Advanced Bioinformatics 2025 assessment"
+author: "m2404864"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+pkgs <- c("tidyverse", "DESeq2", "pheatmap",
+          "GenomicRanges", "ChIPseeker",
+          "BSgenome.Hsapiens.UCSC.hg19",
+          "genefilter", "readxl")
+
+to_install <- pkgs[!pkgs %in% installed.packages()]
+if (length(to_install))
+  BiocManager::install(to_install, ask = FALSE)
+
+lapply(pkgs, library, character.only = TRUE)
+```
+
+### 3.1 Simple sum
+
+```{r}
+sum(1:100)          # should return 5050
+```
+
+### 3.2 A small custom function
+
+```{r}
+power <- function(x, y) x^y
+power(3, 4)         # 81
+```
+
+### 3.3 Fibonacci loop (first 10 numbers)
+
+```{r}
+fib <- numeric(10)
+fib[1:2] <- 1
+for (i in 3:10) fib[i] <- fib[i-1] + fib[i-2]
+fib
+```
+
+### 3.4 Box-plot of *mtcars* MPG by cylinders
+
+```{r fig.width=5, fig.height=4}
+library(ggplot2)
+ggplot(mtcars, aes(x = factor(cyl), y = mpg)) +
+  geom_boxplot() +
+  labs(x = "Cylinders", y = "Miles per gallon")
+```
+
+### 3.5 & 3.6 Two linear models with the *cars* dataset
+
+```{r}
+fit1 <- lm(dist ~ speed, data = cars)              # linear
+fit2 <- lm(dist ~ poly(speed, 2), data = cars)     # quadratic
+summary(fit1)
+summary(fit2)
+```
+
+### 3.7 Plot data with both model fits
+
+```{r fig.width=5, fig.height=4}
+plot(cars$speed, cars$dist, pch = 19,
+     xlab = "Speed", ylab = "Stopping distance")
+abline(fit1, lwd = 2)
+curve(predict(fit2, data.frame(speed = x)),
+      add = TRUE, lwd = 2, lty = 2)
+legend("topleft", legend = c("Linear", "Quadratic"),
+       lty = c(1, 2), lwd = 2, bty = "n")
+```
+
+## 3.8 RNA-seq differential expression with DESeq2
+
+```{r read-data}
+# 1) counts matrix  (change the filename if yours is different)
+cts <- as.matrix(read.csv("counts.csv", row.names = 1))
+
+# 2) sample information
+coldata <- read.delim("exercise1_sample_description.info",
+                      row.names = 1, sep = "\t")
+
+# quick sanity checks
+dim(cts)            # genes × samples
+head(coldata)
+```
+```{r fix-sample-names}
+
+# Clean up sample names in BOTH objects
+clean <- function(x) sub("\\.bam$", "", sub("^TMC_", "", x))
+
+colnames(cts)   <- clean(colnames(cts))
+rownames(coldata) <- clean(rownames(coldata))
+
+# Put rows in the same order as columns
+coldata <- coldata[colnames(cts), ]
+
+# Re-check
+all(colnames(cts) == rownames(coldata))
+```
+
+## 3.9 Build DESeqDataSet & run DESeq
+
+```{r deseq-run}
+# If your sample table has both 'condition' (treatment) and
+# 'batch' (FFA / K0a / K0b) keep them in the design:
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData   = coldata,
+                              design    = ~ batch + condition)
+
+# Drop genes with very low total counts to speed things up
+keep <- rowSums(counts(dds)) >= 10
+dds  <- dds[keep, ]
+
+# Core differential-expression analysis
+dds <- DESeq(dds)
+
+dds        # print a summary line so we see it worked
+```
+
+## 3.10 rlog & VST transformations
+
+```{r transforms}
+# rlog (regularised log) – good for small‐to‐medium datasets
+rld <- rlog(dds, blind = FALSE)
+
+# variance‐stabilising transform (VST) – faster on large sets
+vsd <- vst(dds, blind = FALSE)
+
+# quick sanity: show the variance captured by the first two PCs (rlog)
+pca <- prcomp(t(assay(rld)))
+pca_var <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+pca_var[1:2]      # prints % variance PC1 / PC2
+```
+
+## 3.11 PCA of samples (rlog)
+
+```{r pca-plot, fig.width = 6, fig.height = 5}
+library(ggplot2)
+
+pca_data <- plotPCA(rld, intgroup = c("condition", "batch"), returnData = TRUE)
+percent  <- round(100 * attr(pca_data, "percentVar"), 1)
+
+ggplot(pca_data, aes(PC1, PC2,
+                     colour = condition,
+                     shape  = batch,
+                     label  = rownames(pca_data))) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.4, size = 3) +
+  labs(x = paste0("PC1 (", percent[1], "%)"),
+       y = paste0("PC2 (", percent[2], "%)"),
+       colour = "Condition",
+       shape  = "Batch") +
+  theme_bw()
+```
+
+## 3.12 Heatmap of the 40 most variable genes
+
+```{r heatmap, fig.width = 6, fig.height = 6}
+library(pheatmap)
+
+# pick the 40 genes with the highest variance across samples
+top40 <- head(order(rowVars(assay(rld)), decreasing = TRUE), 40)
+
+mat <- assay(rld)[top40, ]                       # subset
+mat <- mat - rowMeans(mat)                       # centre rows
+
+annotation <- as.data.frame(colData(rld)[, c("condition", "batch")])
+
+pheatmap(mat,
+         annotation_col = annotation,
+         show_rownames  = FALSE,
+         cluster_cols   = TRUE,
+         clustering_method = "complete",
+         scale = "row")
+```
+
+## 3.13 Sample-to-sample distance matrix
+
+```{r sample-distance, fig.width = 5, fig.height = 5}
+sampleDists <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+pheatmap(sampleDistMatrix,
+         labels_row = colnames(rld),
+         labels_col = colnames(rld),
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         main = "Sample-to-sample distances")
+```
+
+## 3.14 PCA of samples (VST) – compare with rlog
+
+```{r pca-vst, fig.width = 6, fig.height = 5}
+pca_vst <- plotPCA(vsd, intgroup = c("condition", "batch"), returnData = TRUE)
+percent_vst <- round(100 * attr(pca_vst, "percentVar"), 1)
+
+ggplot(pca_vst, aes(PC1, PC2,
+                    colour = condition,
+                    shape  = batch,
+                    label  = rownames(pca_vst))) +
+  geom_point(size = 3) +
+  geom_text(vjust = -0.4, size = 3) +
+  labs(x = paste0("PC1 (", percent_vst[1], "%)"),
+       y = paste0("PC2 (", percent_vst[2], "%)"),
+       colour = "Condition",
+       shape  = "Batch") +
+  theme_bw()
+```
+```{r show-resultsNames}
+resultsNames(dds)
+```
+
+## 3.15 Differential-expression results
+
+```{r de-results}
+# Extract DE results for KOa vs FFa
+res <- results(dds, name = "condition_KOa_vs_FFa")
+
+# Shrink log2FC for more stable ranking
+res <- lfcShrink(dds,
+                 coef = "condition_KOa_vs_FFa",
+                 type = "normal",
+                 res = res)
+
+# Order by adjusted P-value (FDR)
+res <- as.data.frame(res[order(res$padj), ])
+
+# Show the top 10 genes in the knitted report
+head(res, 10)
+```
+
+
+```{r write-results, include=FALSE}
+# Write complete results table for KOa vs FFa to file
+write.csv(res, file = "DE_results_KOa_vs_FFa.csv", row.names = TRUE)
+```
+
+## 3.16 Read & intersect ChIP-seq replicates
+
+```{r chip-read-intersect}
+library(GenomicRanges)
+library(ChIPseeker)
+
+# 1) Read each MACS2 peak .xls as GRanges
+rep1 <- readPeakFile("mycmelrep1_peaks.xls")
+rep2 <- readPeakFile("mycmelrep2_peaks.xls")
+
+# 2) Find the overlapping regions
+ovl    <- findOverlaps(rep1, rep2)
+common <- pintersect(rep1[queryHits(ovl)], rep2[subjectHits(ovl)])
+
+# 3) Merge any adjacent overlaps
+common_peaks <- reduce(common)
+
+# 4) Quick sanity check
+length(common_peaks)   # number of common peaks
+head(common_peaks)     # preview first few
+```
+
+## 3.17 Rank & resize top 500 peaks
+
+```{r chip-rank-resize}
+# 1) Extract fold-enrichment from rep1
+fe <- mcols(rep1)$fold_enrichment
+
+# 2) Map FE onto common_peaks via overlaps
+ovl <- findOverlaps(common_peaks, rep1)
+common_peaks$FE <- fe[subjectHits(ovl)]
+
+# 3) Order by decreasing FE and pick the top 500
+ord <- order(common_peaks$FE, decreasing = TRUE)
+top500 <- common_peaks[ord][1:500]
+
+# 4) Resize to 200 bp around each peak’s midpoint
+top500_200 <- resize(top500, width = 200, fix = "center")
+
+# 5) Quick checks
+length(top500_200)   # should be 500
+head(top500_200)     # preview first few
+```
+
+## 3.18 Extract sequences & write FASTA
+
+```{r chip-extract-fasta}
+library(GenomicRanges)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(Biostrings)
+
+# Harmonize chromosome names to UCSC style
+seqlevelsStyle(top500_200) <- "UCSC"
+
+# Retrieve the reference chromosome lengths
+segs <- seqlengths(BSgenome.Hsapiens.UCSC.hg19)
+
+# 1) Filter out any peaks that exceed chromosome boundaries
+keep_idx <- start(top500_200) >= 1 &
+            end(top500_200) <= segs[as.character(seqnames(top500_200))]
+top500_valid <- top500_200[keep_idx]
+
+# 2) Extract the DNA sequences for each valid 200 bp peak
+seqs <- getSeq(BSgenome.Hsapiens.UCSC.hg19, top500_valid)
+
+# 3) Name each sequence by “chr:start-end”
+names(seqs) <- paste0(seqnames(top500_valid), ":",
+                      start(top500_valid), "-",
+                      end(top500_valid))
+
+# 4) Write out to FASTA
+writeXStringSet(seqs,
+                filepath = "top500_common_peaks.fa",
+                format   = "fasta")
+
+# You can now inspect 'top500_common_peaks.fa' in a text editor
+```
